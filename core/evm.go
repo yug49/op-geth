@@ -135,8 +135,38 @@ func CanTransfer(db vm.StateDB, addr common.Address, amount *big.Int) bool {
 	return db.GetBalance(addr).Cmp(amount) >= 0
 }
 
-// Transfer subtracts amount from sender and adds amount to recipient using the given Db
+// Transfer subtracts amount from sender and adds amount to recipient using the given Db.
+// ShadowBase: If the recipient has auto-shield enabled in the PrivacyRouter,
+// the value is redirected to the ShieldedPool and an AutoShielded event is emitted.
 func Transfer(db vm.StateDB, sender, recipient common.Address, amount *big.Int) {
+	// ShadowBase Step 6: If the recipient IS the PrivacyRouter, this is a
+	// rewritten transfer from state_transition.go. Redirect the ETH value
+	// directly to ShieldedPool via StateDB (bypasses the uninitialized proxy).
+	// The routeShield() contract validates the recipient mode and emits
+	// the AutoShielded event; it does not move ETH itself.
+	if recipient == vm.PrivacyRouterAddress {
+		db.SubBalance(sender, amount)
+		db.AddBalance(vm.ShieldedPoolAddress, amount)
+		return
+	}
+	if vm.ShouldAutoShield(db, recipient, sender, amount) {
+		// Redirect value to ShieldedPool instead of recipient
+		db.SubBalance(sender, amount)
+		db.AddBalance(vm.ShieldedPoolAddress, amount)
+		// Track pending balance so the recipient can claim via ShieldedPool.claimAutoShield()
+		vm.WritePendingShield(db, recipient, amount)
+		// Emit AutoShielded event so the frontend/indexer can track shielded deposits
+		db.AddLog(&types.Log{
+			Address: vm.PrivacyRouterAddress,
+			Topics: []common.Hash{
+				vm.AutoShieldedEventTopic,
+				common.BytesToHash(common.LeftPadBytes(sender.Bytes(), 32)),
+				common.BytesToHash(common.LeftPadBytes(recipient.Bytes(), 32)),
+			},
+			Data: common.LeftPadBytes(amount.Bytes(), 32),
+		})
+		return
+	}
 	db.SubBalance(sender, amount)
 	db.AddBalance(recipient, amount)
 }

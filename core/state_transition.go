@@ -474,6 +474,48 @@ func (st *StateTransition) innerTransitionDb() (*ExecutionResult, error) {
 	// - reset transient storage(eip 1153)
 	st.state.Prepare(rules, msg.From, st.evm.Context.Coinbase, msg.To, vm.ActivePrecompiles(rules), msg.AccessList)
 
+	// ── ShadowBase Step 4+7+9: Message-level privacy rewrite ─────────────
+	// If this is a plain ETH transfer (no calldata) to a recipient with
+	// auto-shield enabled, rewrite msg.To → PrivacyRouter and msg.Data →
+	// routeShield(originalRecipient). The EVM then executes the transfer as
+	// a call to PrivacyRouter, which forwards ETH to ShieldedPool. The
+	// Transfer hook (Step 6 guard) will see to==PrivacyRouter and skip the
+	// precompile-level auto-shield, preventing double-shielding.
+	//
+	// Step 7 (gas): The rewrite adds calldata and contract execution, which
+	// needs more gas than a plain 21000-gas transfer. eth_estimateGas already
+	// simulates this path and returns the correct estimate, so wallets that
+	// call eth_estimateGas (e.g. MetaMask) get the right gas limit. However,
+	// if a user hardcodes gas=21000, st.gasRemaining will be 0 after
+	// IntrinsicGas subtraction — not enough for routeShield execution.
+	// In that case, we skip the rewrite and let the existing Transfer hook
+	// in evm.go handle the shielding at the StateDB level (which uses 0 gas).
+	//
+	// Step 9 (edge cases):
+	// - Contract calls with value (len(msg.Data) > 0): NOT rewritten.
+	//   The Transfer hook handles auto-shielding for the value portion.
+	// - Self-transfers, zero-value, system contracts: already filtered by
+	//   ShouldAutoShield returning false.
+	// - Alice sends to PrivacyRouter directly: ShouldAutoShield returns false
+	//   (PrivacyRouter is in the skip list).
+	//
+	// Minimum gas needed for routeShield execution: ~40000 gas
+	// (SLOAD for mode check + CALL to ShieldedPool + LOG3 emission).
+	const privacyRouteMinGas = 40000
+	if !contractCreation && msg.To != nil && len(msg.Data) == 0 &&
+		msg.Value != nil && msg.Value.Sign() > 0 &&
+		st.gasRemaining >= privacyRouteMinGas &&
+		vm.ShouldAutoShield(st.state, *msg.To, msg.From, msg.Value) {
+		originalRecipient := *msg.To
+		router := vm.PrivacyRouterAddress
+		msg.To = &router
+		msg.Data = vm.EncodeRouteShieldCalldata(originalRecipient)
+	}
+	// If gasRemaining < privacyRouteMinGas, the rewrite is skipped.
+	// The Transfer hook (core/evm.go) will detect auto-shield via
+	// ShouldAutoShield and redirect ETH at the StateDB level instead.
+	// The RPC-level masking (Step 3) still applies in both paths.
+
 	var (
 		ret   []byte
 		vmerr error // vm errors do not effect consensus and are therefore not assigned to err
